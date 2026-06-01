@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+.DS_Store
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+*.pkl
+*.npy
+*.npz
+*.csv
+
