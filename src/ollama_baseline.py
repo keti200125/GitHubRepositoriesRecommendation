@@ -1,10 +1,13 @@
-"""Generate a GPT baseline prompt for repository recommendation comparison."""
+"""Generate local Ollama baseline recommendations."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import textwrap
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import pandas as pd
@@ -13,13 +16,19 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPOSITORIES_PATH = PROJECT_ROOT / "data" / "processed" / "repositories_clean.csv"
 OUTPUTS_DIR = PROJECT_ROOT / "outputs"
-PROFILE_COLUMNS = ["Name", "Description", "Stars", "Forks"]
+OLLAMA_GENERATE_URL = "http://localhost:11434/api/generate"
+DEFAULT_MODEL = "mistral"
 DEFAULT_NUM_CANDIDATES = 20
+PROFILE_COLUMNS = ["Name", "Description", "Stars", "Forks"]
+
+
+class OllamaUnavailableError(RuntimeError):
+    """Raised when the local Ollama server is not available."""
 
 
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(description="Generate a GPT baseline recommendation prompt.")
+    parser = argparse.ArgumentParser(description="Run a local Ollama baseline recommendation.")
     parser.add_argument(
         "--repos",
         nargs="+",
@@ -30,7 +39,12 @@ def parse_args() -> argparse.Namespace:
         "--num_candidates",
         type=int,
         default=DEFAULT_NUM_CANDIDATES,
-        help="Number of candidate repositories to include in the prompt.",
+        help="Number of candidate repositories to include.",
+    )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help="Local Ollama model to use.",
     )
     return parser.parse_args()
 
@@ -68,7 +82,7 @@ def find_repository(repositories: pd.DataFrame, repo_name: str) -> pd.Series:
 
 
 def select_profile_repositories(repositories: pd.DataFrame, repo_names: list[str]) -> pd.DataFrame:
-    """Return selected profile repositories in the same order as the CLI input."""
+    """Return selected profile repositories in the same order as the input."""
     selected_rows = []
     seen_names = set()
 
@@ -95,7 +109,6 @@ def sample_candidates(
 
     selected_names = set(selected_repositories["Name"].astype(str))
     candidate_pool = repositories[~repositories["Name"].astype(str).isin(selected_names)].copy()
-
     if candidate_pool.empty:
         raise ValueError("No candidate repositories are available after excluding selected repositories.")
 
@@ -104,7 +117,7 @@ def sample_candidates(
 
 
 def format_repository_list(repositories: pd.DataFrame) -> str:
-    """Format repository metadata as a numbered list for the GPT prompt."""
+    """Format repository metadata as a numbered list for the Ollama prompt."""
     lines = []
 
     for index, row in repositories.iterrows():
@@ -124,7 +137,7 @@ def format_repository_list(repositories: pd.DataFrame) -> str:
 
 
 def generate_prompt(selected_repositories: pd.DataFrame, candidate_repositories: pd.DataFrame) -> str:
-    """Build a copy-ready GPT baseline prompt."""
+    """Build the local LLM baseline prompt."""
     selected_text = format_repository_list(selected_repositories)
     candidate_text = format_repository_list(candidate_repositories)
 
@@ -135,16 +148,44 @@ def generate_prompt(selected_repositories: pd.DataFrame, candidate_repositories:
             selected_text,
             "",
             "Choose the top 5 most relevant repositories from this candidate list.",
-            "Rank them from most relevant to least relevant and briefly explain each choice.",
+            "Return repository names and short reasons.",
             "Use only repositories from the candidate list.",
             "",
             "Candidate repositories:",
             "",
             candidate_text,
             "",
-            "Return your answer as a ranked list with repository name and a short reason.",
+            "Format your answer as a ranked list: repository name - short reason.",
         ]
     )
+
+
+def call_ollama(prompt: str, model: str = DEFAULT_MODEL, url: str = OLLAMA_GENERATE_URL) -> str:
+    """Call the local Ollama generate API."""
+    payload = json.dumps({"model": model, "prompt": prompt, "stream": False}).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Ollama returned HTTP {exc.code}: {error_body}") from exc
+    except urllib.error.URLError as exc:
+        raise OllamaUnavailableError(
+            "Ollama is not running. Start it with: ollama serve"
+        ) from exc
+
+    answer = str(data.get("response", "")).strip()
+    if not answer:
+        raise RuntimeError("Ollama returned an empty response.")
+
+    return answer
 
 
 def safe_filename_part(repo_names: list[str]) -> str:
@@ -154,30 +195,51 @@ def safe_filename_part(repo_names: list[str]) -> str:
     return safe_value.strip("_") or "repositories"
 
 
-def save_prompt(prompt: str, repo_names: list[str], output_dir: Path = OUTPUTS_DIR) -> Path:
-    """Save a GPT prompt to the outputs directory."""
+def save_text(text: str, prefix: str, repo_names: list[str], output_dir: Path = OUTPUTS_DIR) -> Path:
+    """Save a prompt or answer text file under outputs/."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"gpt_prompt_{safe_filename_part(repo_names)}.txt"
-    output_path.write_text(prompt, encoding="utf-8")
+    output_path = output_dir / f"{prefix}_{safe_filename_part(repo_names)}.txt"
+    output_path.write_text(text, encoding="utf-8")
     return output_path
 
 
+def run_ollama_baseline(
+    repo_names: list[str],
+    num_candidates: int = DEFAULT_NUM_CANDIDATES,
+    model: str = DEFAULT_MODEL,
+) -> tuple[str, Path, Path]:
+    """Generate an Ollama baseline answer and save prompt/answer files."""
+    repositories = load_repositories()
+    selected_repositories = select_profile_repositories(repositories, repo_names)
+    candidate_repositories = sample_candidates(repositories, selected_repositories, num_candidates)
+    prompt = generate_prompt(selected_repositories, candidate_repositories)
+    canonical_names = selected_repositories["Name"].astype(str).tolist()
+
+    prompt_path = save_text(prompt, "ollama_prompt", canonical_names)
+    answer = call_ollama(prompt, model)
+    answer_path = save_text(answer, "ollama_answer", canonical_names)
+
+    return answer, prompt_path, answer_path
+
+
 def main() -> None:
-    """Generate and save a GPT baseline prompt."""
+    """Run the local Ollama baseline from the command line."""
     args = parse_args()
 
     try:
-        repositories = load_repositories()
-        selected_repositories = select_profile_repositories(repositories, args.repos)
-        candidate_repositories = sample_candidates(repositories, selected_repositories, args.num_candidates)
-        prompt = generate_prompt(selected_repositories, candidate_repositories)
-        output_path = save_prompt(prompt, selected_repositories["Name"].astype(str).tolist())
+        answer, prompt_path, answer_path = run_ollama_baseline(
+            args.repos,
+            num_candidates=args.num_candidates,
+            model=args.model,
+        )
     except Exception as exc:
-        print("Failed to generate GPT baseline prompt.")
+        print("Failed to run Ollama baseline.")
         print(f"Error: {exc}")
         raise SystemExit(1) from exc
 
-    print(f"Prompt path: {output_path}")
+    print(answer)
+    print(f"\nPrompt path: {prompt_path}")
+    print(f"Answer path: {answer_path}")
 
 
 if __name__ == "__main__":

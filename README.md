@@ -53,3 +53,31 @@ python src/download_dataset.py
 ```
 
 KaggleHub downloads the dataset to a local cache folder and prints the downloaded path. Downloaded files are not moved into this repository. Kaggle credentials may be required if Kaggle asks for authentication.
+
+## Local LLM baseline with Ollama
+
+Install Ollama:
+
+```bash
+brew install ollama
+```
+
+Download the default local model:
+
+```bash
+ollama pull mistral
+```
+
+Start the Ollama server:
+
+```bash
+ollama serve
+```
+
+Run the Streamlit demo:
+
+```bash
+streamlit run app.py
+```
+
+The demo includes a local LLM comparison using Ollama. If Ollama is not running, the app shows a warning instead of crashing.

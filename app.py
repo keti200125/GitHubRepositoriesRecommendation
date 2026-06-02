@@ -9,6 +9,12 @@ import pandas as pd
 import streamlit as st
 
 from src.recommender import recommend_graph, recommend_hybrid, recommend_semantic
+from src.ollama_baseline import (
+    DEFAULT_MODEL as OLLAMA_DEFAULT_MODEL,
+    DEFAULT_NUM_CANDIDATES as OLLAMA_NUM_CANDIDATES,
+    OllamaUnavailableError,
+    run_ollama_baseline,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -190,6 +196,29 @@ def main() -> None:
                 hide_index=True,
             )
             st.caption(f"Top {TOP_RECOMMENDATIONS} results generated in {elapsed_time:.2f}s")
+
+    st.subheader("Compare with local LLM (Ollama)")
+    st.caption(
+        f"Uses local Ollama model `{OLLAMA_DEFAULT_MODEL}` with "
+        f"{OLLAMA_NUM_CANDIDATES} sampled candidate repositories."
+    )
+
+    if st.button("Run Ollama Baseline", type="primary"):
+        try:
+            with st.spinner("Asking local Ollama model..."):
+                answer, prompt_path, answer_path = run_ollama_baseline(
+                    list(selected_profile),
+                    num_candidates=OLLAMA_NUM_CANDIDATES,
+                    model=OLLAMA_DEFAULT_MODEL,
+                )
+        except OllamaUnavailableError as exc:
+            st.warning(str(exc))
+        except Exception as exc:
+            st.error(str(exc))
+        else:
+            st.markdown(answer)
+            st.caption(f"Prompt saved to: {prompt_path}")
+            st.caption(f"Answer saved to: {answer_path}")
 
 
 if __name__ == "__main__":
