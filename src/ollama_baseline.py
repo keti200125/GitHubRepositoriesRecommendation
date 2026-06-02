@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import re
 import textwrap
@@ -18,12 +19,21 @@ REPOSITORIES_PATH = PROJECT_ROOT / "data" / "processed" / "repositories_clean.cs
 OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 OLLAMA_GENERATE_URL = "http://localhost:11434/api/generate"
 DEFAULT_MODEL = "mistral"
-DEFAULT_NUM_CANDIDATES = 20
 PROFILE_COLUMNS = ["Name", "Description", "Stars", "Forks"]
 
 
 class OllamaUnavailableError(RuntimeError):
     """Raised when the local Ollama server is not available."""
+
+
+@dataclass(frozen=True)
+class OllamaBaselineResult:
+    """Ollama baseline output and saved artifact paths."""
+
+    answer: str
+    prompt_path: Path
+    answer_path: Path
+    removed_selected_repositories: list[str]
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,12 +44,6 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         required=True,
         help="Repository names that represent the user's profile.",
-    )
-    parser.add_argument(
-        "--num_candidates",
-        type=int,
-        default=DEFAULT_NUM_CANDIDATES,
-        help="Number of candidate repositories to include.",
     )
     parser.add_argument(
         "--model",
@@ -98,22 +102,23 @@ def select_profile_repositories(repositories: pd.DataFrame, repo_names: list[str
     return pd.DataFrame(selected_rows).loc[:, PROFILE_COLUMNS].reset_index(drop=True)
 
 
-def sample_candidates(
+def normalized_name(value: object) -> str:
+    """Normalize repository names for case-insensitive comparison."""
+    return str(value).casefold()
+
+
+def select_candidate_repositories(
     repositories: pd.DataFrame,
     selected_repositories: pd.DataFrame,
-    num_candidates: int,
 ) -> pd.DataFrame:
-    """Randomly sample candidate repositories, excluding profile repositories."""
-    if num_candidates <= 0:
-        raise ValueError("num_candidates must be greater than 0.")
-
-    selected_names = set(selected_repositories["Name"].astype(str))
-    candidate_pool = repositories[~repositories["Name"].astype(str).isin(selected_names)].copy()
-    if candidate_pool.empty:
+    """Return all candidate repositories, excluding selected repositories case-insensitively."""
+    selected_names = set(selected_repositories["Name"].map(normalized_name))
+    repository_names = repositories["Name"].map(normalized_name)
+    candidates = repositories[~repository_names.isin(selected_names)].copy()
+    if candidates.empty:
         raise ValueError("No candidate repositories are available after excluding selected repositories.")
 
-    sample_count = min(num_candidates, len(candidate_pool))
-    return candidate_pool.sample(n=sample_count).loc[:, PROFILE_COLUMNS].reset_index(drop=True)
+    return candidates.loc[:, PROFILE_COLUMNS].reset_index(drop=True)
 
 
 def format_repository_list(repositories: pd.DataFrame) -> str:
@@ -143,15 +148,19 @@ def generate_prompt(selected_repositories: pd.DataFrame, candidate_repositories:
 
     return "\n".join(
         [
-            "Given the user likes these repositories:",
+            "USER PROFILE - repositories the user already likes:",
             "",
             selected_text,
             "",
-            "Choose the top 5 most relevant repositories from this candidate list.",
-            "Return repository names and short reasons.",
-            "Use only repositories from the candidate list.",
+            "TASK:",
+            "Choose the top 5 most relevant NEW repositories from the candidate list below.",
+            "Do not recommend any repository from the user's selected repositories.",
+            "Choose only from the provided candidate list.",
+            "Do not invent repository names.",
+            "Return exactly 5 repositories.",
+            "Provide a short reason for each recommendation.",
             "",
-            "Candidate repositories:",
+            "CANDIDATE REPOSITORIES:",
             "",
             candidate_text,
             "",
@@ -203,23 +212,50 @@ def save_text(text: str, prefix: str, repo_names: list[str], output_dir: Path = 
     return output_path
 
 
+def remove_selected_repositories_from_answer(
+    answer: str,
+    selected_repo_names: list[str],
+) -> tuple[str, list[str]]:
+    """Remove answer lines that contain any selected repository name."""
+    selected_names = {normalized_name(name): name for name in selected_repo_names}
+    removed_names = set()
+    kept_lines = []
+
+    for line in answer.splitlines():
+        normalized_line = normalized_name(line)
+        matched_names = [display_name for name, display_name in selected_names.items() if name in normalized_line]
+        if matched_names:
+            removed_names.update(matched_names)
+            continue
+
+        kept_lines.append(line)
+
+    cleaned_answer = "\n".join(kept_lines).strip()
+    return cleaned_answer, sorted(removed_names, key=normalized_name)
+
+
 def run_ollama_baseline(
     repo_names: list[str],
-    num_candidates: int = DEFAULT_NUM_CANDIDATES,
     model: str = DEFAULT_MODEL,
-) -> tuple[str, Path, Path]:
+) -> OllamaBaselineResult:
     """Generate an Ollama baseline answer and save prompt/answer files."""
     repositories = load_repositories()
     selected_repositories = select_profile_repositories(repositories, repo_names)
-    candidate_repositories = sample_candidates(repositories, selected_repositories, num_candidates)
+    candidate_repositories = select_candidate_repositories(repositories, selected_repositories)
     prompt = generate_prompt(selected_repositories, candidate_repositories)
     canonical_names = selected_repositories["Name"].astype(str).tolist()
 
     prompt_path = save_text(prompt, "ollama_prompt", canonical_names)
-    answer = call_ollama(prompt, model)
+    raw_answer = call_ollama(prompt, model)
+    answer, removed_names = remove_selected_repositories_from_answer(raw_answer, canonical_names)
     answer_path = save_text(answer, "ollama_answer", canonical_names)
 
-    return answer, prompt_path, answer_path
+    return OllamaBaselineResult(
+        answer=answer,
+        prompt_path=prompt_path,
+        answer_path=answer_path,
+        removed_selected_repositories=removed_names,
+    )
 
 
 def main() -> None:
@@ -227,9 +263,8 @@ def main() -> None:
     args = parse_args()
 
     try:
-        answer, prompt_path, answer_path = run_ollama_baseline(
+        result = run_ollama_baseline(
             args.repos,
-            num_candidates=args.num_candidates,
             model=args.model,
         )
     except Exception as exc:
@@ -237,9 +272,12 @@ def main() -> None:
         print(f"Error: {exc}")
         raise SystemExit(1) from exc
 
-    print(answer)
-    print(f"\nPrompt path: {prompt_path}")
-    print(f"Answer path: {answer_path}")
+    print(result.answer)
+    if result.removed_selected_repositories:
+        removed = ", ".join(result.removed_selected_repositories)
+        print(f"\nRemoved selected repositories from Ollama response: {removed}")
+    print(f"\nPrompt path: {result.prompt_path}")
+    print(f"Answer path: {result.answer_path}")
 
 
 if __name__ == "__main__":

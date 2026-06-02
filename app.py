@@ -11,7 +11,6 @@ import streamlit as st
 from src.recommender import recommend_graph, recommend_hybrid, recommend_semantic
 from src.ollama_baseline import (
     DEFAULT_MODEL as OLLAMA_DEFAULT_MODEL,
-    DEFAULT_NUM_CANDIDATES as OLLAMA_NUM_CANDIDATES,
     OllamaUnavailableError,
     run_ollama_baseline,
 )
@@ -89,12 +88,13 @@ def build_profile_recommendations(
 ) -> pd.DataFrame:
     """Aggregate recommendations across selected repositories."""
     candidate_pool_size = max(top_k, len(repositories) - 1)
-    selected_names = set(selected_repositories)
+    selected_names = {name.casefold() for name in selected_repositories}
     recommendation_frames = []
 
     for repo_name in selected_repositories:
         recommendations = get_seed_recommendations(repo_name, method, candidate_pool_size)
-        recommendations = recommendations[~recommendations["Name"].astype(str).isin(selected_names)].copy()
+        recommendation_names = recommendations["Name"].astype(str).str.casefold()
+        recommendations = recommendations[~recommendation_names.isin(selected_names)].copy()
         recommendation_frames.append(recommendations)
 
     if not recommendation_frames:
@@ -136,6 +136,15 @@ def selected_repository_details(repositories: pd.DataFrame, selected_repositorie
         {name: index for index, name in enumerate(selected_repositories)}
     )
     return selected.sort_values("_selection_order").loc[:, PROFILE_COLUMNS]
+
+
+@st.cache_data(show_spinner=False)
+def get_ollama_baseline(selected_repositories: tuple[str, ...]):
+    """Run the Ollama baseline for a selected profile."""
+    return run_ollama_baseline(
+        list(selected_repositories),
+        model=OLLAMA_DEFAULT_MODEL,
+    )
 
 
 def main() -> None:
@@ -197,28 +206,32 @@ def main() -> None:
             )
             st.caption(f"Top {TOP_RECOMMENDATIONS} results generated in {elapsed_time:.2f}s")
 
-    st.subheader("Compare with local LLM (Ollama)")
+    st.subheader("LLM Comparison (Ollama)")
     st.caption(
-        f"Uses local Ollama model `{OLLAMA_DEFAULT_MODEL}` with "
-        f"{OLLAMA_NUM_CANDIDATES} sampled candidate repositories."
+        "The local LLM is used as a baseline for comparison against the semantic, graph, "
+        "and hybrid recommenders. It receives all cleaned repositories except the selected profile."
     )
+    compare_with_ollama = st.checkbox("Compare with local LLM (Ollama)")
 
-    if st.button("Run Ollama Baseline", type="primary"):
+    if compare_with_ollama:
+        st.write(f"Model: `{OLLAMA_DEFAULT_MODEL}`")
+        st.write("Selected repositories: " + ", ".join(selected_profile))
+
         try:
             with st.spinner("Asking local Ollama model..."):
-                answer, prompt_path, answer_path = run_ollama_baseline(
-                    list(selected_profile),
-                    num_candidates=OLLAMA_NUM_CANDIDATES,
-                    model=OLLAMA_DEFAULT_MODEL,
-                )
+                result = get_ollama_baseline(selected_profile)
         except OllamaUnavailableError as exc:
-            st.warning(str(exc))
+            st.warning("Ollama is not available. Start it with: ollama serve")
         except Exception as exc:
             st.error(str(exc))
         else:
-            st.markdown(answer)
-            st.caption(f"Prompt saved to: {prompt_path}")
-            st.caption(f"Answer saved to: {answer_path}")
+            if result.removed_selected_repositories:
+                removed = ", ".join(result.removed_selected_repositories)
+                st.warning(f"Removed selected repositories from Ollama response: {removed}")
+            if result.answer:
+                st.markdown(result.answer)
+            else:
+                st.warning("Ollama did not return any valid recommendations after filtering selected repositories.")
 
 
 if __name__ == "__main__":
