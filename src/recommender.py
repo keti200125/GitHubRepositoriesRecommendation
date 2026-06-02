@@ -22,7 +22,6 @@ NODE2VEC_EMBEDDINGS_PATH = PROCESSED_DATA_DIR / "node2vec_embeddings.pkl"
 BASE_RESULT_COLUMNS = [
     "Name",
     "Description",
-    "URL",
     "Stars",
     "Forks",
     "Issues",
